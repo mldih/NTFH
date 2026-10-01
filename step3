@@ -1,0 +1,177 @@
+# src/snn_models.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import snntorch as snn
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import logging
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+def rate_sparsity_loss(spikes, target_rate=0.1):
+    """Rate-based sparsity loss: penalize high firing rates."""
+    mean_rate = spikes.mean()
+    return F.relu(mean_rate - target_rate)
+
+class GammaMicrocolumnSNN(nn.Module):
+    """Gamma Oscillation Microcolumn SNN Model"""
+    def __init__(self, num_columns=12, neurons_per_column=64, input_size=784,
+                 num_classes=10, beta=0.9, threshold=1.0, gamma_freq=40.0,
+                 dropout_rate=0.1):
+        super().__init__()
+        self.num_columns = num_columns
+        self.neurons_per_column = neurons_per_column
+        self.total_neurons = num_columns * neurons_per_column
+        self.gamma_freq = gamma_freq
+        self.dropout_rate = dropout_rate
+        self.beta = nn.Parameter(torch.rand(self.total_neurons) * 0.3 + 0.7)
+        self.threshold = threshold
+        self.input_encoder = nn.Sequential(
+            nn.Linear(input_size, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, self.total_neurons)
+        )
+        self.local_connections = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(neurons_per_column, neurons_per_column, bias=False),
+                nn.BatchNorm1d(neurons_per_column),
+                nn.Dropout(dropout_rate)
+            ) for _ in range(num_columns)
+        ])
+        self.global_synchronization = nn.Sequential(
+            nn.Linear(num_columns, num_columns, bias=False),
+            nn.BatchNorm1d(num_columns),
+            nn.Dropout(dropout_rate)
+        )
+        self.feedback_modulation = nn.Sequential(
+            nn.Linear(num_classes, num_columns, bias=False),
+            nn.BatchNorm1d(num_columns)
+        )
+        self.output_decoder = nn.Sequential(
+            nn.Linear(self.total_neurons, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(128, num_classes)
+        )
+        self.gamma_frequency = nn.Parameter(torch.tensor(gamma_freq * 0.001))
+        self.phase_offset = nn.Parameter(torch.rand(num_columns) * 2 * np.pi)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=neurons_per_column,
+            num_heads=4,
+            dropout=dropout_rate,
+            batch_first=True
+        )
+        self._initialize_weights()
+        logger.info(f"Initialized Gamma Microcolumn SNN: {num_columns} columns, "
+                     f"{neurons_per_column} neurons/column, "
+                     f"{sum(p.numel() for p in self.parameters()):,} parameters")
+
+    def _initialize_weights(self):
+        local_linears = [l[0] for l in self.local_connections]
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                if module in local_linears:
+                    nn.init.sparse_(module.weight, sparsity=0.8, std=0.1)
+                elif module is self.global_synchronization[0]:
+                    nn.init.normal_(module.weight, mean=0.05, std=0.02)
+                elif module is self.feedback_modulation[0]:
+                    nn.init.normal_(module.weight, mean=0.1, std=0.05)
+                else:
+                    nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.BatchNorm1d):
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
+
+    def forward(self, x, feedback_input=None, num_steps=50, return_dynamics=False):
+        batch_size = x.size(0)
+        membrane_potential = torch.zeros(batch_size, self.total_neurons, device=x.device)
+        spikes_history = []
+        membrane_history = []
+        gamma_phase_history = []
+        attention_weights_history = []
+        encoded_input = self.input_encoder(x)
+        for step in range(num_steps):
+            current_time = step * 0.001
+            gamma_phase = (2 * np.pi * self.gamma_frequency * current_time
+                         + self.phase_offset)
+            gamma_modulation = torch.sin(gamma_phase).unsqueeze(0)
+            membrane_reshaped = membrane_potential.view(batch_size, self.num_columns, self.neurons_per_column)
+            local_inputs = []
+            for col in range(self.num_columns):
+                local_activity = self.local_connections[col](membrane_reshaped[:, col, :])
+                local_inputs.append(local_activity)
+            local_input = torch.stack(local_inputs, dim=1)
+            attended_output, attention_weights = self.attention(
+                query=membrane_reshaped,
+                key=membrane_reshaped,
+                value=membrane_reshaped
+            )
+            column_means = membrane_reshaped.mean(dim=2)
+            global_input = self.global_synchronization(column_means)
+            global_input = global_input.unsqueeze(2).expand(-1, -1, self.neurons_per_column)
+            if feedback_input is not None:
+                feedback_weights = self.feedback_modulation(feedback_input)
+                feedback_input_expanded = feedback_weights.unsqueeze(2).expand(-1, -1, self.neurons_per_column)
+            else:
+                feedback_input_expanded = 0
+            total_input = (encoded_input.view(batch_size, self.num_columns, self.neurons_per_column)
+                          + local_input
+                          + attended_output
+                          + global_input * gamma_modulation.unsqueeze(2)
+                          + feedback_input_expanded)
+            total_input = total_input.view(batch_size, -1)
+            membrane_potential = (self.beta * membrane_potential
+                                + (1 - self.beta) * total_input)
+            spikes = (membrane_potential >= self.threshold).float()
+            membrane_potential = membrane_potential * (1 - spikes)
+            spikes_history.append(spikes)
+            membrane_history.append(membrane_potential.clone())
+            gamma_phase_history.append(gamma_phase.detach())
+            attention_weights_history.append(attention_weights.detach())
+        spike_pattern = torch.stack(spikes_history, dim=1)
+        output_activity = spike_pattern.mean(dim=1)
+        final_output = self.output_decoder(output_activity)
+        output_dict = {
+            'output': final_output,
+            'spikes': torch.stack(spikes_history, dim=1),
+            'membrane_potentials': torch.stack(membrane_history, dim=1),
+            'gamma_phases': torch.stack(gamma_phase_history, dim=0),
+            'firing_rates': output_activity,
+            'attention_weights': torch.stack(attention_weights_history, dim=0)
+        }
+        return output_dict
+
+    def get_topological_representation(self, x, num_steps=50):
+        with torch.no_grad():
+            outputs = self.forward(x, num_steps=num_steps)
+        return outputs['firing_rates']
+
+class TopologyAwareTrainer:
+    """Topology-aware SNN Trainer"""
+    def __init__(self, model, learning_rate=1e-3, topology_weight=0.01,
+                 sparsity_weight=0.001, classification_weight=1.0):
+        self.model = model
+        self.learning_rate = learning_rate
+        self.topology_weight = topology_weight
+        self.sparsity_weight = sparsity_weight
+        self.classification_weight = classification_weight
+        self.optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=100)
+        self.classification_loss = nn.CrossEntropyLoss()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.to(self.device)
+        logger.info(f"Initialized topology-aware trainer (device: {self.device})")
+
+    def topological_enta

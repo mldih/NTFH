@@ -1,0 +1,84 @@
+import numpy as np
+from ruptures import Pelt
+
+
+def generate_ei_series(n_steps=100):
+    """Generate a synthetic E/I ratio series with a phase transition."""
+    np.random.seed(42)
+    e_i_ratios = np.linspace(1.2, 0.5, n_steps)
+    
+    # High-value region (normal E/I)
+    t_values = np.zeros(n_steps)
+    high_region = e_i_ratios > 0.85
+    low_region = e_i_ratios <= 0.85
+    
+    t_values[high_region] = 0.95 + np.random.normal(0, 0.02, high_region.sum())
+    t_values[low_region] = 0.45 + np.random.normal(0, 0.02, low_region.sum())
+    
+    return e_i_ratios, t_values
+
+
+def detect_phase_transition(t_values, e_i_ratios):
+    """Detect topological phase transition using PELT algorithm."""
+    n = len(t_values)
+    
+    # Use PELT to find change points
+    series = t_values.reshape(-1, 1)
+    sigma = np.std(t_values)
+    
+    # Various penalties
+    results = {}
+    for scale in [1.0, 2.0, 5.0, 10.0, 20.0]:
+        penalty = scale
+        algo = Pelt(model="rbf", min_size=5).fit(series)
+        try:
+            cps = algo.predict(pen=penalty)
+            results[scale] = cps
+        except Exception as e:
+            results[scale] = None
+    
+    # Select best change point based on jump amplitude
+    cp_idx = None
+    best_jump = 0
+    
+    for scale, cps in results.items():
+        if cps is None:
+            continue
+        # Find the largest jump at each candidate change point
+        for cp in cps:
+            if cp >= len(t_values):
+                continue
+            if cp < 1:
+                continue
+            jump = abs(t_values[cp] - t_values[cp - 1])
+            if jump > best_jump:
+                best_jump = jump
+                cp_idx = cp - 1
+    
+    if cp_idx is None:
+        return None, None, None, best_jump
+    
+    # Compute critical E/I ratio and transition index
+    p_c = e_i_ratios[cp_idx]
+    t_c = t_values[cp_idx]
+    
+    return p_c, t_c, cp_idx, best_jump
+
+
+def test_phase_transition():
+    """Run phase transition detection test."""
+    print("Testing topological phase transition detection...")
+    
+    e_i_ratios, t_values = generate_ei_series()
+    p_c, t_c, cp_idx, best_jump = detect_phase_transition(t_values, e_i_ratios)
+    
+    if p_c is not None:
+        print(f"p_c={p_c:.3f}, t_c={t_c:.3f}, cp_idx={cp_idx}")
+    else:
+        print("No phase transition detected")
+    
+    return p_c, t_c, cp_idx, best_jump
+
+
+if __name__ == "__main__":
+    test_phase_transition()

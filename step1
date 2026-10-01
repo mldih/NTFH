@@ -1,0 +1,66 @@
+import numpy as np
+from ripser import ripser
+
+
+def calculate_topological_complexity(persistence_diagram, q=2):
+    """
+    Calculate topological complexity from a persistence diagram.
+    
+    Args:
+        persistence_diagram: array of shape (n_points, 3) with columns [birth, death, dimension]
+        q: persistence weight exponent (default 2)
+    
+    Returns:
+        float: topological complexity value
+    """
+    total_complexity = 0
+    dimension_weights = {0: 1.0, 1: 0.8, 2: 0.6}
+    unique_dims = np.unique(persistence_diagram[:, 2])
+    for dim in unique_dims:
+        dim_mask = persistence_diagram[:, 2] == dim
+        dim_points = persistence_diagram[dim_mask]
+        if len(dim_points) > 0:
+            persistence = dim_points[:, 1] - dim_points[:, 0]
+            # Handle infinite persistence values
+            finite_mask = ~np.isinf(persistence)
+            if finite_mask.any():
+                persistence = np.where(np.isinf(persistence),
+                                       np.max(persistence[finite_mask]),
+                                       persistence)
+            dim_complexity = np.sum(persistence ** q)
+            weight = dimension_weights.get(int(dim), 0.5)
+            total_complexity += weight * dim_complexity
+    return total_complexity
+
+
+def test_topology():
+    """Test topological complexity with circle point cloud."""
+    print("Testing topological complexity calculation...")
+    
+    # Simple test case
+    test_diagram = np.array([[0.0, 1.0, 0],
+                             [0.0, 2.0, 1]])
+    t1 = calculate_topological_complexity(test_diagram)
+    print(f"  Simple test: {t1} (expected: 4.2)")
+    
+    # Circle point cloud
+    theta = np.linspace(0, 2 * np.pi, 100)
+    circle = np.column_stack([np.cos(theta), np.sin(theta)])
+    
+    result = ripser(circle, maxdim=1)
+    dgms = result['dgms']
+    
+    persistence_diagram = np.vstack([
+        np.column_stack([dgms[0][:, 0], dgms[0][:, 1], np.zeros(len(dgms[0]))]),
+        np.column_stack([dgms[1][:, 0], dgms[1][:, 1], np.ones(len(dgms[1]))])
+    ])
+    
+    t2 = calculate_topological_complexity(persistence_diagram)
+    print(f"  Circle test: {t2}")
+    
+    return t1, t2, persistence_diagram
+
+
+if __name__ == "__main__":
+    t1, t2, pd_diagram = test_topology()
+    print(f"\nResults: T_simple = {t1}, T_circle = {t2}")
